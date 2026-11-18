@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+sitecheck-report.md
+sitecheck-report.json
+.venv/
+venv/

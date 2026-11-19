@@ -17,7 +17,7 @@ import sys
 import argparse
 
 from sitecheck.core import (
-    ScanContext, confirm_authorization, resolve_target,
+    ScanContext, confirm_authorization, resolve_target, preflight,
 )
 from sitecheck import headers, tls, cookies, recon, csrf, xss, sqli, direnum, report
 
@@ -123,6 +123,12 @@ def main(argv=None) -> int:
         cookies=_kv(args.cookie, "="),
         verbose=args.verbose,
     )
+
+    ok, msg = preflight(ctx)
+    if msg:
+        print("\n" + msg + "\n")
+    if not ok:
+        return 2
 
     checks = select_checks(args)
     print(f"\nRunning {len(checks)} check(s) against {args.url} "

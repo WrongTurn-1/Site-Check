@@ -92,6 +92,16 @@ class Finding:
 # Rate-limited HTTP client
 # --------------------------------------------------------------------------- #
 
+def _silence_insecure_warnings() -> None:
+    """When TLS verification is intentionally off, suppress urllib3's repeated
+    InsecureRequestWarning - we already warn the user ourselves, once."""
+    try:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    except Exception:
+        pass
+
+
 class RateLimiter:
     """Simple token-spacing limiter: at most `rps` requests per second."""
 
@@ -134,6 +144,8 @@ class ScanContext:
         self.port = parsed.port or (443 if self.scheme == "https" else 80)
 
     def _build_session(self) -> requests.Session:
+        if not self.verify_tls:
+            _silence_insecure_warnings()
         s = requests.Session()
         retry = Retry(total=2, backoff_factor=0.3,
                       status_forcelist=[502, 503, 504],
@@ -217,3 +229,75 @@ def resolve_target(url: str) -> tuple[bool, str]:
 def dump_json(findings: list[Finding], path: str) -> None:
     with open(path, "w") as fh:
         json.dump([f.to_dict() for f in findings], fh, indent=2)
+
+
+# --------------------------------------------------------------------------- #
+# Preflight: reachability + TLS sanity before we run the real checks
+# --------------------------------------------------------------------------- #
+
+COMMON_WEB_PORTS = [80, 443, 8080, 8000, 8443, 8888, 3000, 5000, 5173, 9000]
+
+
+def _tcp_open(host: str, port: int, timeout: float) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=min(timeout, 3.0)):
+            return True
+    except OSError:
+        return False
+
+
+def _probe_common_ports(host: str, timeout: float) -> list[int]:
+    return [p for p in COMMON_WEB_PORTS if _tcp_open(host, p, timeout)]
+
+
+def preflight(ctx: "ScanContext") -> tuple[bool, str]:
+    """Verify the target is actually reachable before scanning.
+
+    Returns (ok, message). On an untrusted TLS cert this flips
+    ctx.verify_tls to False (with a loud notice) so the HTTP-client checks
+    can still run - the cert problem is still reported by the tls module.
+    """
+    host, port, scheme = ctx.host, ctx.port, ctx.scheme
+
+    # 1) Is anything listening on the target port at all?
+    if not _tcp_open(host, port, ctx.timeout):
+        others = _probe_common_ports(host, ctx.timeout)
+        lines = [
+            f"Cannot reach {host}:{port} - the connection was refused or timed out.",
+            "That is a connectivity problem, not a security result: nothing is "
+            "listening there (or a firewall is dropping the connection).",
+        ]
+        if others:
+            plist = ", ".join(str(p) for p in others)
+            lines.append(f"However, these ports ARE open on {host}: {plist}")
+            lines.append(f"Re-run against one of them, e.g.:  "
+                         f"python sitecheck.py http://{host}:{others[0]}")
+        else:
+            lines.append("None of the common web ports (80, 443, 8080, 8000, ...) "
+                         "responded either. Check the app is running and bound to "
+                         "0.0.0.0 (not 127.0.0.1), and that the host firewall allows "
+                         "the port.")
+        return False, "\n".join(lines)
+
+    # 2) HTTPS: does the certificate validate? If not, continue insecurely.
+    if scheme == "https" and ctx.verify_tls:
+        import ssl
+        try:
+            sslctx = ssl.create_default_context()
+            with socket.create_connection((host, port), timeout=ctx.timeout) as s:
+                with sslctx.wrap_socket(s, server_hostname=host):
+                    pass
+        except ssl.SSLError:
+            ctx.verify_tls = False
+            _silence_insecure_warnings()
+            return True, (
+                "NOTE: the target's TLS certificate is not trusted (self-signed, "
+                "or issued for a different name). This is normal before a domain and "
+                "real certificate are in place.\n"
+                "Continuing with certificate verification OFF so the application-layer "
+                "checks can run. The certificate itself is still reported as a finding."
+            )
+        except OSError:
+            pass  # transient; let the real checks surface it
+
+    return True, ""
